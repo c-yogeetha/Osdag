@@ -613,3 +613,624 @@ class BoltPatternGenerator(QDialog):
             text_item.setPos(x1 - text_item.boundingRect().width(), (y1 + y2) / 2 - text_item.boundingRect().height() / 2)
         else:
             text_item.setPos(x1, (y1 + y2) / 2 - text_item.boundingRect().height() / 2)
+
+
+# >>> BEGIN plate_joint_spacing (added by patch_spacing_diagrams.py) >>> [eol=0]
+# plate_joint_spacing.py
+#
+# Spacing-details dialog for the *plated* bolted joints:
+#
+#     * Lap Joint  - Bolted
+#     * Butt Joint - Bolted
+#
+# The drawing is the plan view of the 3D model in its DEFAULT orientation (plate 2
+# at the top, plate 1 at the bottom; bolts drawn as circles) - it is not rotated.
+#
+# Nothing in the drawing is hard-coded: every length, bolt position and
+# proportion is computed from the design result of the module, using exactly
+# the same placement rules as the CAD builders
+# (``cad/SimpleConnections/BoltedLapJoint/bolted_lap_joint.py`` and
+# ``cad/SimpleConnections/BoltedButtJoint/Butt_joint_bolted.py``), and the whole
+# drawing is scaled to fit the window.
+#
+# Colours
+#     Lap  : long plate #ffffff | short plate #f4f4e3 | bolt #ff3737
+#     Butt : top #ffffff | middle (cover) #dbdbce | bottom #f4f4e3 | bolt #ff3737
+
+import math
+
+from PySide6.QtWidgets import (QApplication, QDialog, QWidget, QVBoxLayout,
+                               QHBoxLayout, QLabel, QSizeGrip, QSizePolicy)
+from PySide6.QtGui import (QPainter, QPen, QBrush, QColor, QFont,
+                           QFontMetrics, QPolygonF)
+from PySide6.QtCore import Qt, QPointF, QRectF, QSize
+
+from osdag_core.Common import KEY_DISP_BUTTJOINTBOLTED
+
+# --------------------------------------------------------------------------
+# Colours requested for the drawing
+# --------------------------------------------------------------------------
+COLOR_WHITE = "#ffffff"
+COLOR_BEIGE = "#f4f4e3"
+COLOR_COVER = "#dbdbce"
+COLOR_BOLT = "#ff3737"
+COLOR_BOLT_EDGE = "#5a1010"
+
+# CAD: each main plate of the butt joint is 1.25 * the cover plate length.
+_BUTT_PLATE_TO_COVER = 1.25
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+def _num(value, default=0.0):
+    """Robust float conversion (handles None, '', numpy types, NaN)."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if math.isnan(out) or math.isinf(out):
+        return float(default)
+    return out
+
+
+def _count(value, default=1):
+    """Robust positive integer conversion."""
+    try:
+        out = int(round(float(value)))
+    except (TypeError, ValueError):
+        return int(default)
+    return max(out, 1)
+
+
+def _fmt(value):
+    """Dimension text: at most one decimal, no trailing '.0'."""
+    text = f"{round(float(value), 1):.1f}"
+    return text[:-2] if text.endswith(".0") else text
+
+
+# --------------------------------------------------------------------------
+# Geometry (pure python - no Qt, easy to test)
+# --------------------------------------------------------------------------
+class JointLayout:
+    """
+    Drawing model, in millimetres, in the default (un-rotated) 3D plan view.
+
+    Origin is the top-left corner of the drawing:
+        x : horizontal distance to the right   (across the plate width)
+        y : vertical distance downwards        (along the plate length)
+    """
+
+    def __init__(self):
+        self.kind = ""
+        self.width = 0.0          # horizontal extent  (plate width)
+        self.length = 0.0         # vertical extent    (whole drawing length)
+        self.rects = []           # (y0, y1, colour, name)  full-width bands
+        self.bolts = []           # (x, y)
+        self.head_radius = 0.0    # bolt head circum-radius
+        self.top_chain = []       # (x0, x1, kind)  edge | gauge ... | edge
+        self.left_chain = []      # (y0, y1, kind)  end | pitch ... | end
+        self.right_spans = []     # (y0, y1)        plate / cover lengths
+        self.bottom_spans = []    # (x0, x1)        overall width
+
+
+def _gauge_positions(width, rows, gauge, edge):
+    """x (from the plate edge, as in the CAD) of every bolt line."""
+    rows = max(int(rows), 1)
+    if rows == 1:
+        edge = edge if edge > 0 else width / 2.0
+        return [edge], 0.0, edge
+    if gauge <= 0:
+        # Defensive: a multi-line pattern with no gauge would stack bolts.
+        gauge = max((width - 2.0 * edge) / (rows - 1), 0.0)
+    return [edge + r * gauge for r in range(rows)], gauge, edge
+
+
+def _finish_top_chain(layout, xs):
+    """Horizontal chain across the width: edge | gauge ... gauge | edge."""
+    marks = [0.0] + list(xs) + [layout.width]
+    kinds = ["edge"] + ["gauge"] * (len(xs) - 1) + ["edge"]
+    layout.top_chain = [(marks[i], marks[i + 1], kinds[i])
+                        for i in range(len(kinds)) if marks[i + 1] - marks[i] > 1e-6]
+
+
+def build_lap_layout(width, rows, cols, number_bolts, pitch, gauge, edge, end,
+                     overlap, bolt_dia):
+    """
+    Lap joint, default plan view.
+
+    CAD (top view, y up): plate 2 (top plate) spans y in [0, 2*ov], plate 1
+    spans [-ov, ov]; bolts at  x = edge + row*gauge  and  y = end + col*pitch
+    (col-major fill, stopped after ``number_bolts``).  On screen y points down:
+    y_screen = 2*ov - y_cad.
+    """
+    width = _num(width)
+    rows, cols = _count(rows), _count(cols)
+    pitch, end = _num(pitch), _num(end)
+    xs, gauge, edge = _gauge_positions(width, rows, _num(gauge), _num(edge))
+
+    overlap = _num(overlap)
+    if overlap <= 0:
+        overlap = 2.0 * end + (cols - 1) * pitch
+    n_total = _count(number_bolts, rows * cols) if _num(number_bolts) > 0 else rows * cols
+
+    lay = JointLayout()
+    lay.kind = "lap"
+    lay.width = width
+    lay.length = 3.0 * overlap
+    lay.rects = [
+        (0.0, 2.0 * overlap, COLOR_WHITE, "Plate 2"),
+        (2.0 * overlap, 3.0 * overlap, COLOR_BEIGE, "Plate 1"),
+    ]
+    lay.head_radius = 0.8 * _num(bolt_dia)          # CAD: head radius = 0.8 d
+
+    count = 0
+    done = False
+    for c in range(cols):
+        for r in range(rows):
+            if count >= n_total:
+                done = True
+                break
+            lay.bolts.append((xs[r], 2.0 * overlap - end - c * pitch))
+            count += 1
+        if done:
+            break
+
+    marks = ([overlap] + [2.0 * overlap - end - c * pitch for c in range(cols - 1, -1, -1)]
+             + [2.0 * overlap])
+    kinds = ["end"] + ["pitch"] * (cols - 1) + ["end"]
+    lay.left_chain = [(marks[i], marks[i + 1], kinds[i]) for i in range(len(kinds))
+                      if marks[i + 1] - marks[i] > 1e-6]
+    _finish_top_chain(lay, xs)
+    lay.right_spans = [(0.0, 2.0 * overlap), (2.0 * overlap, 3.0 * overlap)]
+    lay.bottom_spans = [(0.0, width)]
+    return lay
+
+
+def build_butt_layout(width, rows, cols, pitch, gauge, edge, end, bolt_dia):
+    """
+    Butt joint, default plan view.
+
+    CAD: cover length C = 2*(2*end + (n_y-1)*pitch); each main plate is
+    1.25*C long and butts at the centre of the cover; the same bolt grid is
+    mirrored on both sides of the joint line (full n_x * n_y grid per side).
+    Plate 2 is at the top, plate 1 at the bottom.
+    """
+    width = _num(width)
+    n_x, n_y = _count(rows), _count(cols)        # across width / along length
+    pitch, end = _num(pitch), _num(end)
+    xs, gauge, edge = _gauge_positions(width, n_x, _num(gauge), _num(edge))
+
+    cover = 2.0 * (2.0 * end + (n_y - 1) * pitch)
+    plate = _BUTT_PLATE_TO_COVER * cover
+    visible = plate - cover / 2.0                # main plate visible beside cover (0.75*C)
+    joint = visible + cover / 2.0                # joint line = centre of the cover
+
+    lay = JointLayout()
+    lay.kind = "butt"
+    lay.width = width
+    lay.length = 2.0 * visible + cover
+    lay.rects = [
+        (0.0, visible, COLOR_WHITE, "Plate 2"),
+        (visible, visible + cover, COLOR_COVER, "Cover Plate"),
+        (visible + cover, lay.length, COLOR_BEIGE, "Plate 1"),
+    ]
+    lay.head_radius = 0.5 * _num(bolt_dia)          # CAD: head radius = d / 2
+
+    for j in range(n_y):
+        off = end + j * pitch
+        for x in xs:
+            lay.bolts.append((x, joint - off))      # plate 2 side (above the joint)
+            lay.bolts.append((x, joint + off))      # plate 1 side (below the joint)
+
+    upper = [joint - end - j * pitch for j in range(n_y - 1, -1, -1)]
+    lower = [joint + end + j * pitch for j in range(n_y)]
+    marks = [visible] + upper + [joint] + lower + [visible + cover]
+    kinds = (["end"] + ["pitch"] * (n_y - 1) + ["end"]) * 2
+    lay.left_chain = [(marks[i], marks[i + 1], kinds[i]) for i in range(len(kinds))
+                      if marks[i + 1] - marks[i] > 1e-6]
+    _finish_top_chain(lay, xs)
+    lay.right_spans = [(0.0, visible), (visible, visible + cover),
+                       (visible + cover, lay.length)]
+    lay.bottom_spans = [(0.0, width)]
+    return lay
+
+
+# --------------------------------------------------------------------------
+# Canvas
+# --------------------------------------------------------------------------
+class _SpacingCanvas(QWidget):
+    """Draws a JointLayout scaled to fit the widget (dimension text stays a
+    constant, large, readable size)."""
+
+    FONT_PT = 14.0          # dimension text size
+
+    def __init__(self, model, is_light=True, parent=None):
+        super().__init__(parent)
+        self.model = model
+        self.is_light = is_light
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        font = QFont(self.font())
+        font.setPointSizeF(self.FONT_PT)
+        self._font = font
+        fm = QFontMetrics(font)
+        th = fm.height()
+        self._text_h = th
+        self._arrow = max(7.0, th * 0.42)
+        # widest label that can appear beside a vertical dimension
+        # (a plain number or a grouped one such as "12 x 100")
+        tw = max(fm.horizontalAdvance("0000.0"), fm.horizontalAdvance("00 \u00d7 000"))
+        self._gap = th + 12                       # plate -> dimension line
+        # margins (px) around the plate that hold the dimension lines + text
+        self.m_left = int(self._gap + 6 + tw + 10)
+        self.m_right = int(self._gap + 6 + tw + 10)
+        self.m_top = int(self._gap + 2 * th + 12)
+        self.m_bottom = int(self._gap + 16)
+        # room for the labels of the longest vertical chain, even when they are all crowded
+        labels = max(self._collapsed_count(model.left_chain), len(model.right_spans))
+        min_draw_h = max(220, labels * (th + 2) + 12)
+        self.setMinimumSize(QSize(self.m_left + self.m_right + 200,
+                                  self.m_top + self.m_bottom + int(min_draw_h)))
+
+    @staticmethod
+    def _collapsed_count(chain):
+        """Number of labels a chain needs once equal pitch/gauge runs are grouped."""
+        n, prev = 0, None
+        for a, b, kind in chain:
+            key = (kind, round(b - a, 1))
+            if kind in ("pitch", "gauge") and key == prev:
+                continue
+            n += 1
+            prev = key
+        return n
+
+    # -- sizing ------------------------------------------------------------
+    def preferred_size(self, max_draw_w=420.0, max_draw_h=460.0, min_draw_w=110.0,
+                       hard_max_h=560.0):
+        """Canvas size that gives the drawing a natural aspect (never a thin
+        sliver, never huge)."""
+        m = self.model
+        s = min(max_draw_w / m.width, max_draw_h / m.length)
+        s_thin = min(min_draw_w / m.width, hard_max_h / m.length)
+        s = max(s, s_thin)
+        return QSize(int(m.width * s) + self.m_left + self.m_right,
+                     int(m.length * s) + self.m_top + self.m_bottom)
+
+    def sizeHint(self):
+        return self.preferred_size()
+
+    # -- painting ----------------------------------------------------------
+    def paintEvent(self, _event):
+        m = self.model
+        if m.length <= 0 or m.width <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setFont(self._font)
+        fm = QFontMetrics(self._font)
+
+        bg = QColor("#ffffff") if self.is_light else QColor("#4A4A4A")
+        p.fillRect(self.rect(), bg)
+        self._ink = QColor("#000000") if self.is_light else QColor("#e6e6e6")
+        self._ext = QColor(self._ink)
+        self._ext.setAlpha(120)
+
+        avail_w = max(self.width() - self.m_left - self.m_right, 40)
+        avail_h = max(self.height() - self.m_top - self.m_bottom, 40)
+        s = min(avail_w / m.width, avail_h / m.length)
+        dw, dh = m.width * s, m.length * s
+        ox = self.m_left + (avail_w - dw) / 2.0
+        oy = self.m_top + (avail_h - dh) / 2.0
+        X = lambda x: ox + x * s
+        Y = lambda y: oy + y * s
+        self._last_xform = (ox, oy, s)           # (kept for the self-test)
+
+        # plates (full-width bands)
+        outline = QPen(QColor("#000000"), 1.0)
+        for y0, y1, colour, _name in m.rects:
+            p.setPen(outline)
+            p.setBrush(QBrush(QColor(colour)))
+            p.drawRect(QRectF(X(0), Y(y0), dw, (y1 - y0) * s))
+
+        # bolts: circles of the CAD head radius (all the same size)
+        radius = max(m.head_radius * s, 3.0)
+        p.setPen(QPen(QColor(COLOR_BOLT_EDGE), 1.0))
+        p.setBrush(QBrush(QColor(COLOR_BOLT)))
+        for bx, by in m.bolts:
+            p.drawEllipse(QPointF(X(bx), Y(by)), radius, radius)
+
+        # extension-line anchors, so the dashes start at the bolts
+        col_top, row_left = {}, {}
+        for bx, by in m.bolts:
+            kx, ky = round(bx, 3), round(by, 3)
+            col_top[kx] = min(col_top.get(kx, by), by)       # top-most bolt in a column
+            row_left[ky] = min(row_left.get(ky, bx), bx)     # left-most bolt in a row
+
+        gap = self._gap
+
+        # across the width (edge / gauge), above the plate
+        top_y = oy - gap
+        segs = [(X(a), X(b), b - a, k) for a, b, k in m.top_chain]
+        anchors = {}
+        for a, b, _k in m.top_chain:
+            for pos in (a, b):
+                anchors[round(X(pos), 1)] = Y(col_top.get(round(pos, 3), 0.0))
+        self._hchain(p, fm, segs, top_y, anchors, up=True, max_tier=1, plate_edge_y=oy)
+
+        # overall width, below the plate
+        bot_y = oy + dh + gap
+        self._hchain(p, fm, [(X(0), X(m.width), m.width, "overall")], bot_y, {},
+                     up=False, max_tier=0, plate_edge_y=oy + dh)
+
+        # along the length (end / pitch), left of the plate
+        left_x = ox - gap
+        vsegs = [(Y(a), Y(b), b - a, k) for a, b, k in m.left_chain]
+        amap = {}
+        for a, b, _k in m.left_chain:
+            for pos in (a, b):
+                amap[round(Y(pos), 1)] = X(row_left.get(round(pos, 3), 0.0))
+        y_lo, y_hi = fm.height() / 2.0 + 3, self.height() - fm.height() / 2.0 - 3
+        self._vchain(p, fm, vsegs, left_x, amap, side=-1, default_x=ox, y_lo=y_lo, y_hi=y_hi)
+
+        # plate / cover lengths, right of the plate
+        right_x = ox + dw + gap
+        rsegs = [(Y(a), Y(b), b - a, "span") for a, b in m.right_spans]
+        self._vchain(p, fm, rsegs, right_x, {}, side=+1, default_x=ox + dw, y_lo=y_lo, y_hi=y_hi)
+        p.end()
+
+    # -- dimension helpers -------------------------------------------------
+    def _arrow_head(self, p, tip, direction):
+        """Filled arrow head with the tip at ``tip`` pointing along
+        ``direction`` (unit vector)."""
+        size = self._arrow
+        dx, dy = direction
+        bx, by = tip.x() - dx * size, tip.y() - dy * size
+        nx, ny = -dy, dx
+        poly = QPolygonF([tip, QPointF(bx + nx * size / 3, by + ny * size / 3),
+                          QPointF(bx - nx * size / 3, by - ny * size / 3)])
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(self._ink))
+        p.drawPolygon(poly)
+
+    def _dim_line(self, p, a, b):
+        """Dimension line from a to b (QPointF) with arrows at both ends;
+        arrows go outside when the segment is too short."""
+        length = math.hypot(b.x() - a.x(), b.y() - a.y())
+        if length < 1e-6:
+            return
+        d = ((b.x() - a.x()) / length, (b.y() - a.y()) / length)
+        p.setPen(QPen(self._ink, 1.0))
+        if length >= 2 * self._arrow + 4:
+            p.drawLine(a, b)
+            self._arrow_head(p, a, (-d[0], -d[1]))
+            self._arrow_head(p, b, d)
+        else:
+            ext = self._arrow + 3.0
+            p.drawLine(QPointF(a.x() - d[0] * ext, a.y() - d[1] * ext),
+                       QPointF(b.x() + d[0] * ext, b.y() + d[1] * ext))
+            self._arrow_head(p, a, d)
+            self._arrow_head(p, b, (-d[0], -d[1]))
+
+    @staticmethod
+    def _merge(segs, fm, vertical):
+        """Collapse runs of equal pitch/gauge that are too tight to label
+        individually into a single 'n x value' dimension."""
+        out, i, n = [], 0, len(segs)
+        while i < n:
+            a, b, val, kind = segs[i]
+            j = i
+            if kind in ("pitch", "gauge"):
+                while j + 1 < n and segs[j + 1][3] == kind and abs(segs[j + 1][2] - val) < 0.05:
+                    j += 1
+            count = j - i + 1
+            if count > 1:
+                text = _fmt(val)
+                need = (fm.height() + 2) if vertical else (fm.horizontalAdvance(text) + 8)
+                if abs(b - a) < need:
+                    out.append((a, segs[j][1], f"{count} \u00d7 {_fmt(val)}"))
+                    i = j + 1
+                    continue
+            out.append((a, b, _fmt(val)))
+            i += 1
+        return out
+
+    def _hchain(self, p, fm, segs, line_y, anchors, up, max_tier, plate_edge_y):
+        """Horizontal dimension chain; text sits above the line."""
+        items = self._merge(segs, fm, vertical=False)
+        th = fm.height()
+        p.setPen(QPen(self._ext, 1.0, Qt.DashLine))
+        bounds = sorted({round(x, 1) for a, b, _t in items for x in (a, b)})
+        for x in bounds:
+            if up:
+                y0 = anchors.get(x, plate_edge_y)
+                p.drawLine(QPointF(x, y0), QPointF(x, line_y - 4))
+            else:
+                p.drawLine(QPointF(x, plate_edge_y), QPointF(x, line_y + 4))
+        placed = {t: [] for t in range(max_tier + 1)}
+        for a, b, text in items:
+            self._dim_line(p, QPointF(a, line_y), QPointF(b, line_y))
+            tw = fm.horizontalAdvance(text)
+            cx = (a + b) / 2.0
+            chosen = None
+            for tier in range(max_tier + 1):
+                rect = QRectF(cx - tw / 2.0, line_y - 3 - th - tier * (th + 1), tw, th)
+                if any(rect.adjusted(-3, 0, 3, 0).intersects(r) for r in placed[tier]):
+                    continue
+                chosen = (tier, rect)
+                break
+            if chosen is None:
+                tier = max_tier
+                chosen = (tier, QRectF(cx - tw / 2.0, line_y - 3 - th - tier * (th + 1), tw, th))
+            tier, rect = chosen
+            placed[tier].append(rect)
+            if tier > 0:
+                p.setPen(QPen(self._ext, 1.0))
+                p.drawLine(QPointF(cx, line_y), QPointF(cx, rect.bottom()))
+            p.setPen(QPen(self._ink))
+            p.drawText(rect, Qt.AlignCenter, text)
+
+    def _vchain(self, p, fm, segs, line_x, anchors, side, default_x, y_lo, y_hi):
+        """Vertical dimension chain; text sits beside the line (side -1 = left,
+        +1 = right).  Crowded labels are spread apart (centred on their own
+        segments, kept between y_lo and y_hi) and joined to the line by a leader."""
+        items = self._merge(segs, fm, vertical=True)
+        th = fm.height()
+        step = th + 2
+        p.setPen(QPen(self._ext, 1.0, Qt.DashLine))
+        bounds = sorted({round(y, 1) for a, b, _t in items for y in (a, b)})
+        for y in bounds:
+            x0 = anchors.get(y, default_x)
+            p.drawLine(QPointF(x0, y), QPointF(line_x - side * 4, y))
+
+        centres = [(a + b) / 2.0 for a, b, _t in items]
+        pos = [min(max(c, y_lo), y_hi) for c in centres]
+        for _ in range(80):                      # relax overlaps symmetrically
+            moved = False
+            for i in range(1, len(pos)):
+                d = pos[i] - pos[i - 1]
+                if d < step - 0.01:
+                    push = (step - d) / 2.0
+                    pos[i - 1] -= push
+                    pos[i] += push
+                    moved = True
+            pos = [min(max(v, y_lo), y_hi) for v in pos]
+            if not moved:
+                break
+
+        for (a, b, text), cy, py in zip(items, centres, pos):
+            self._dim_line(p, QPointF(line_x, a), QPointF(line_x, b))
+            tw = fm.horizontalAdvance(text)
+            edge_x = line_x + side * 5
+            left = edge_x - tw if side < 0 else edge_x
+            rect = QRectF(left, py - th / 2.0, tw, th)
+            if abs(py - cy) > 2.0:
+                p.setPen(QPen(self._ext, 1.0))
+                near = rect.right() if side < 0 else rect.left()
+                p.drawLine(QPointF(line_x, cy), QPointF(near, py))
+            p.setPen(QPen(self._ink))
+            p.drawText(rect, Qt.AlignCenter, text)
+
+
+# --------------------------------------------------------------------------
+# Dialog
+# --------------------------------------------------------------------------
+class PlateJointSpacingDialog(QDialog):
+    """
+    Spacing viewer for Lap Joint (Bolted) and Butt Joint (Bolted).
+    Same constructor signature as the other output-detail dialogs, so it can
+    be launched through ``OutputDock.run_spacing_script``.
+    """
+
+    PANEL_WIDTH = 210
+
+    def __init__(self, connection_obj, rows=0, cols=0, main=None):
+        super().__init__()
+        app = QApplication.instance()
+        self.theme = app.theme_manager
+        self.connection = connection_obj
+        self.main = main if main is not None else connection_obj
+        self.model, self.values = self._read_design(self.main)
+        self.initUI()
+
+    # -- data --------------------------------------------------------------
+    @staticmethod
+    def _read_design(main):
+        try:
+            is_butt = (main.module_name() == KEY_DISP_BUTTJOINTBOLTED)
+        except Exception:
+            is_butt = hasattr(main, "platec")
+
+        g = lambda name, default=0.0: getattr(main, name, default)
+        width = _num(g("width"))
+        rows, cols = _count(g("rows")), _count(g("cols"))
+        pitch, gauge = _num(g("final_pitch")), _num(g("final_gauge"))
+        edge, end = _num(g("final_edge_dist")), _num(g("final_end_dist"))
+        try:
+            dia = _num(main.bolt.bolt_diameter_provided)
+        except Exception:
+            dia = 0.0
+
+        if is_butt:
+            model = build_butt_layout(width, rows, cols, pitch, gauge, edge, end, dia)
+        else:
+            model = build_lap_layout(width, rows, cols, g("number_bolts", 0), pitch,
+                                     gauge, edge, end, g("len_conn"), dia)
+        # The design values exactly as computed (shown even for a single
+        # row / column, where they are the minimum values used for the layout).
+        shown = [
+            ("Pitch Distance", _fmt(pitch)),
+            ("End Distance", _fmt(end)),
+            ("Gauge Distance", _fmt(gauge)),
+            ("Edge Distance", _fmt(edge if edge > 0 else width / 2.0)),
+        ]
+        return model, shown
+
+    # -- UI ----------------------------------------------------------------
+    def setupWrapper(self):
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint)
+        self.setObjectName("spacing_capacity_details")
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(1, 1, 1, 1)
+        main_layout.setSpacing(0)
+        self.title_bar = CustomTitleBar()
+        self.title_bar.setTitle("Spacing Details")
+        main_layout.addWidget(self.title_bar)
+        self.content_widget = QWidget(self)
+        main_layout.addWidget(self.content_widget, 1)
+        size_grip = QSizeGrip(self)
+        size_grip.setFixedSize(16, 16)
+        overlay = QHBoxLayout()
+        overlay.setContentsMargins(0, 0, 4, 4)
+        overlay.addStretch(1)
+        overlay.addWidget(size_grip, 0, Qt.AlignBottom | Qt.AlignRight)
+        main_layout.addLayout(overlay)
+
+    def initUI(self):
+        self.setupWrapper()
+
+        body = QHBoxLayout()
+        body.setContentsMargins(10, 10, 10, 6)
+        body.setSpacing(10)
+
+        panel = QWidget()
+        panel.setFixedWidth(self.PANEL_WIDTH)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        for name, value in self.values:
+            row = QHBoxLayout()
+            label = QLabel(f"{name} :")
+            label.setStyleSheet("font-size: 14px; font-weight: bold;")
+            val = QLabel(value)
+            val.setStyleSheet("font-size: 14px;")
+            row.addWidget(label)
+            row.addWidget(val)
+            row.addStretch(1)
+            panel_layout.addLayout(row)
+        note = QLabel("(All Dimensions are in mm)")
+        note.setStyleSheet("font-size: 12px; font-style: italic;")
+        panel_layout.addWidget(note)
+        panel_layout.addStretch(1)
+
+        self.canvas = _SpacingCanvas(self.model, is_light=self.theme.is_light())
+        body.addWidget(panel, 0)
+        body.addWidget(self.canvas, 1)
+        self.content_widget.setLayout(body)
+
+        # Size the window to the drawing (bounded by the screen), centred.
+        pref = self.canvas.preferred_size()
+        width = pref.width() + self.PANEL_WIDTH + 10 + 20 + 2
+        height = pref.height() + 32 + 16 + 6 + 10 + 16 + 2
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            width = min(width, int(geo.width() * 0.9))
+            height = min(height, int(geo.height() * 0.9))
+            x = geo.x() + (geo.width() - width) // 2
+            y = geo.y() + (geo.height() - height) // 2
+        else:
+            x = y = 100
+        self.setGeometry(x, y, int(width), int(height))
+        self.setMinimumSize(self.PANEL_WIDTH + self.canvas.minimumWidth() + 40,
+                            self.canvas.minimumHeight() + 90)
+# <<< END plate_joint_spacing <<<

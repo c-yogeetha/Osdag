@@ -39,7 +39,7 @@ class ButtJointBolted(MomentConnection):
         self.base_metal_capacity_kN = None
         self.utilization_breakdown = {}
         self.design_error = ''
-        self.spacing = None
+        # NOTE: Don't initialize self.spacing = None here - it would shadow the spacing() method!
         self.packing_plate_thickness = 0.0
         self.beta_pkg = 1.0
         self.calculated_cover_plate_thickness = 0.0
@@ -387,6 +387,10 @@ class ButtJointBolted(MomentConnection):
         t20 = (KEY_OUT_BOLT_CONN_LEN, KEY_OUT_DISP_BOLT_CONN_LEN, TYPE_TEXTBOX,
                self.len_conn if flag else '', True)
         out_list.append(t20)
+
+        # Spacing Details button (opens the horizontal spacing diagram)
+        t21 = (KEY_OUT_SPACING, KEY_OUT_DISP_SPACING, TYPE_OUT_BUTTON, ['Spacing Details', self.spacing], True)
+        out_list.append(t21)
 
         # Populate Hover Dict (Butt Joint Bolted)
         self.hover_dict["Plate 1"] = (

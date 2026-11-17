@@ -46,7 +46,7 @@ from ..output_details.seated_angle_capacity import (
     SeatedAngleSectionDetails,
 )
 from ..output_details.end_plate import EndPlateDetails
-from ..output_details.bolt_pattern import BoltPatternGenerator
+from ..output_details.bolt_pattern import BoltPatternGenerator, PlateJointSpacingDialog
 from ..output_details.seated_angle_spacing import SeatedAngleDetails
 from ..output_details.cleat_angle import (
     CleatAngleDetails,
@@ -919,12 +919,9 @@ class OutputDock(QWidget):
                     main=main
                 )
 
-             elif main.module_name() == KEY_DISP_LAPJOINTBOLTED:
-                self.run_spacing_script(
-                    rows=self.backend.rows,
-                    cols=self.backend.cols,
-                    main=main
-                )
+             elif main.module_name() in (KEY_DISP_LAPJOINTBOLTED, KEY_DISP_BUTTJOINTBOLTED):
+                # Lap / Butt joint (bolted): horizontal, to-scale spacing diagram
+                self.run_spacing_script(0, 0, PlateJointSpacingDialog, main)
 
              else:
                 flag_legacyspacing = True
